@@ -1,14 +1,15 @@
 export const TOKENS: Record<string, RegExp> = {
 	attribute:
-		/\[\s*(?:(?<namespace>\*|[-\w\P{ASCII}]*)\|)?(?<name>(?:[-\w\P{ASCII}]|\\.)+)\s*(?:(?<operator>\W?=)\s*(?<value>.+?)\s*(\s(?<caseSensitive>[iIsS]))?\s*)?\]/gu,
-	id: /#(?<name>(?:[-\w\P{ASCII}]|\\.)+)/gu,
-	class: /\.(?<name>(?:[-\w\P{ASCII}]|\\.)+)/gu,
+		/\[\s*(?:(?<namespace>\*|[-\w\P{ASCII}]*)\|)?(?<name>(?:[-\w\P{ASCII}]|(?:\\[0-9a-fA-F]{1,6}\s?|\\.))+)\s*(?:(?<operator>\W?=)\s*(?<value>.+?)\s*(\s(?<caseSensitive>[iIsS]))?\s*)?\]/gu,
+	id: /#(?<name>(?:[-\w\P{ASCII}]|(?:\\[0-9a-fA-F]{1,6}\s?|\\.))+)/gu,
+	class: /\.(?<name>(?:[-\w\P{ASCII}]|(?:\\[0-9a-fA-F]{1,6}\s?|\\.))+)/gu,
 	comma: /\s*,\s*/g, // must be before combinator
-	combinator: /\s*[\s>+~]\s*/g, // this must be after attribute
+	combinator: /\s*(?:\|\||[\s>+~])\s*/g, // this must be after attribute
+	nesting: /&/g,
 	'pseudo-element': /::(?<name>[-\w\P{ASCII}]+)(?:\((?<argument>¶*)\))?/gu, // this must be before pseudo-class
 	'pseudo-class': /:(?<name>[-\w\P{ASCII}]+)(?:\((?<argument>¶*)\))?/gu,
 	universal: /(?:(?<namespace>\*|[-\w\P{ASCII}]*)\|)?\*/gu,
-	type: /(?:(?<namespace>\*|[-\w\P{ASCII}]*)\|)?(?<name>(?:[-\w\P{ASCII}]|\\.)+)/gu, // this must be last
+	type: /(?:(?<namespace>\*|[-\w\P{ASCII}]*)\|)?(?<name>(?:[-\w\P{ASCII}]|(?:\\[0-9a-fA-F]{1,6}\s?|\\.))+)/gu, // this must be last
 };
 
 export const TRIM_TOKENS = new Set<string>(['combinator', 'comma']);
@@ -18,12 +19,19 @@ export const RECURSIVE_PSEUDO_CLASSES = new Set<string>([
 	'is',
 	'where',
 	'has',
+	'host',
+	'host-context',
 	'matches',
 	'-moz-any',
 	'-webkit-any',
 	'nth-child',
 	'nth-last-child',
 ]);
+
+/**
+ * Pseudo-elements whose argument contributes to specificity (e.g. ::slotted()).
+ */
+export const RECURSIVE_PSEUDO_ELEMENTS = new Set<string>(['slotted'])
 
 const nthChildRegExp = /(?<index>[\dn+-]+)\s+of\s+(?<subtree>.+)/;
 export const RECURSIVE_PSEUDO_CLASSES_ARGS: Record<string, RegExp> = {
@@ -132,7 +140,7 @@ export function tokenizeBy(text: string, grammar = TOKENS): Token[] {
 }
 
 const STRING_PATTERN = /(['"])([^\\\n]*?)\1/g;
-const ESCAPE_PATTERN = /\\./g;
+const ESCAPE_PATTERN = /\\[0-9a-fA-F]{1,6}\s?|\\./g;
 export function tokenize(selector: string, grammar = TOKENS): Token[] {
 	// Prevent leading/trailing whitespaces from being interpreted as combinators
 	selector = selector.trim();
@@ -292,33 +300,48 @@ function nestTokens(tokens: Token[], { list = true } = {}): AST {
 }
 
 /**
- * Traverse an AST in depth-first order
+ * Traverse an AST in depth-first order.
+ *
+ * Yields `[token, parent, inSubtree]` triples: `inSubtree` is true when the token
+ * was reached through the argument of a pseudo-class like `:is()` or a
+ * pseudo-element like `::slotted()`.
  */
 export function* flatten(
 	node: AST,
 	/**
 	 * @internal
 	 */
-	parent?: AST
-): IterableIterator<[Token, AST | undefined]> {
+	parent?: AST,
+	inSubtree = false
+): IterableIterator<[Token, AST | undefined, boolean]> {
 	switch (node.type) {
 		case 'list':
 			for (let child of node.list) {
-				yield* flatten(child, node);
+				yield* flatten(child, node, inSubtree);
 			}
 			break;
 		case 'complex':
-			yield* flatten(node.left, node);
-			yield* flatten(node.right, node);
+			yield* flatten(node.left, node, inSubtree);
+			yield* flatten(node.right, node, inSubtree);
 			break;
 		case 'relative':
-			yield* flatten(node.right, node);
+			yield* flatten(node.right, node, inSubtree);
 			break;
 		case 'compound':
-			yield* node.list.map((token): [Token, Compound] => [token, node]);
+			yield* node.list.map((token): [Token, Compound, boolean] => [token, node, inSubtree]);
 			break;
 		default:
-			yield [node, parent];
+			yield [node, parent, inSubtree];
+			if (node.type === 'pseudo-class' || node.type === 'pseudo-element') {
+				// Recurse into the argument's AST so that traversal APIs and callers
+				// like parse() and specificity() see the whole selector. (`subtree`
+				// is only declared on PseudoClassToken, but a pseudo-element carries
+				// one too once its argument has been parsed.)
+				const subtree: AST | undefined = (node as { subtree?: AST }).subtree;
+				if (subtree) {
+					yield* flatten(subtree, node, true);
+				}
+			}
 	}
 }
 
@@ -369,10 +392,22 @@ export function parse(
 	}
 
 	for (const [token] of flatten(ast)) {
-		if (token.type !== 'pseudo-class' || !token.argument) {
+		if (token.type !== 'pseudo-class' && token.type !== 'pseudo-element') {
 			continue;
 		}
-		if (!RECURSIVE_PSEUDO_CLASSES.has(token.name)) {
+		if (!token.argument) {
+			continue;
+		}
+		const recursesIntoArgument =
+			token.type === 'pseudo-class'
+				? RECURSIVE_PSEUDO_CLASSES.has(token.name)
+				: RECURSIVE_PSEUDO_ELEMENTS.has(token.name);
+		if (!recursesIntoArgument) {
+			continue;
+		}
+		// Subtrees of pseudos found inside another pseudo's argument are built
+		// when flatten() reaches them, so nested arguments get parsed too.
+		if (token.subtree) {
 			continue;
 		}
 		let argument = token.argument;
@@ -470,7 +505,12 @@ export function specificity(selector: string | AST): number[] {
 	}
 
 	const ret = [0, 0, 0];
-	for (const [token] of flatten(ast)) {
+	// Tokens reached through a recursive pseudo's argument are accounted for by
+	// the pseudo itself; visiting them here as well would double-count them.
+	for (const [token, , inSubtree] of flatten(ast)) {
+		if (inSubtree) {
+			continue;
+		}
 		switch (token.type) {
 			case 'id':
 				ret[0]++;
@@ -480,11 +520,28 @@ export function specificity(selector: string | AST): number[] {
 				ret[1]++;
 				break;
 			case 'pseudo-element':
+				ret[2]++;
+				// ::slotted() adds the specificity of its argument as well.
+				if (token.subtree) {
+					const sub = specificity(token.subtree);
+					sub.forEach((s, i) => (ret[i] += s));
+				}
+				break;
 			case 'type':
 				ret[2]++;
 				break;
 			case 'pseudo-class':
 				if (token.name === 'where') {
+					break;
+				}
+				// :host() and :host-context() contribute their own pseudo-class
+				// specificity on top of that of their argument.
+				if (token.name === 'host' || token.name === 'host-context') {
+					ret[1]++;
+					if (token.subtree) {
+						const sub = specificity(token.subtree);
+						sub.forEach((s, i) => (ret[i] += s));
+					}
 					break;
 				}
 				if (
@@ -538,6 +595,7 @@ export interface ClassToken extends NamedToken {
 export interface PseudoElementToken extends NamedToken {
 	type: 'pseudo-element';
 	argument?: string;
+	subtree?: AST;
 }
 
 export interface PseudoClassToken extends NamedToken {
@@ -565,6 +623,10 @@ export interface TypeToken extends NamespacedToken, NamedToken {
 	type: 'type';
 }
 
+export interface NestingToken extends BaseToken {
+	type: 'nesting';
+}
+
 export interface UnknownToken extends BaseToken {
 	type: never;
 }
@@ -579,6 +641,7 @@ export type Token =
 	| PseudoClassToken
 	| UniversalToken
 	| TypeToken
+	| NestingToken
 	| UnknownToken;
 
 export interface Complex {
